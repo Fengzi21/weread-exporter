@@ -181,6 +181,44 @@ class WeReadWebPage(object):
     async def _update_cookie(self) -> None:
         self._cookie = await self._read_cookie()
 
+    async def _sync_cookie_after_navigation(self) -> None:
+        """清理与服务器 domain-wide 新 cookie 冲突的 host-only 旧 cookie。
+
+        通过 ``_inject_cookie`` 注入的 cookie 都是 host-only（``weread.qq.com``），
+        而服务器刷新会话时会下发 domain-wide（``.weread.qq.com``）的新 cookie。
+        同名 cookie 下浏览器会优先发送 host-only 的旧值，导致章节内容接口拿到
+        过期会话密钥而返回空内容。这里只删除与 domain-wide 新 cookie 同名的
+        host-only 旧 cookie，保留 ``wr_skey``、``wr_vid`` 等服务器并未重新下发的
+        关键 cookie，并同步 domain-wide 新值供 ``utils.fetch`` 使用。
+        """
+        try:
+            cookies = await self._page.cookies()
+        except Exception:
+            return
+        domain_wide = {
+            c.get("name"): c.get("value")
+            for c in cookies
+            if c.get("domain") == ".weread.qq.com"
+        }
+        # 只删除与 domain-wide 新 cookie 同名的 host-only 旧 cookie
+        for cookie in cookies:
+            if (cookie.get("domain") == "weread.qq.com"
+                    and cookie.get("name") in domain_wide):
+                try:
+                    await self._page.deleteCookie(
+                        {
+                            "name": cookie.get("name"),
+                            "domain": "weread.qq.com",
+                            "path": cookie.get("path", "/"),
+                        }
+                    )
+                except Exception:
+                    continue
+        # 用服务器下发的最新 domain-wide cookie 更新本地 cookie
+        for name, value in domain_wide.items():
+            if name and value is not None:
+                self._cookie[name] = value
+
     async def check_valid(self) -> bool:
         html = await utils.fetch(self._home_url)
         if b'"soldout":1' in html:
@@ -354,6 +392,9 @@ class WeReadWebPage(object):
             await self._inject_cookie()
 
         await self._page.goto(self._home_url)
+        # 服务器会刷新会话 cookie，清理注入的 host-only 旧 cookie，
+        # 否则章节内容接口会因重复的过期 cookie 返回空内容。
+        await self._sync_cookie_after_navigation()
         # await self.wait_for_selector("div.readerFooter a")
         if force_login:
             await self.login()
@@ -365,6 +406,8 @@ class WeReadWebPage(object):
         if self._browser:
             await self._browser.close()
             self._browser = self._page = None
+        # 浏览器关闭后，重开浏览器需要重新安装请求拦截
+        self._proxy_installed = False
 
     async def get_html(self) -> str:
         return await self._page.evaluate("document.documentElement.outerHTML;")
@@ -395,9 +438,7 @@ class WeReadWebPage(object):
 
     def handle_log(self, message: Any) -> None:
         text = message.text
-        logging.info("[%s][Console] %s" % (self.__class__.__name__, text))
-        with open("%s.log" % self._book_id, "a+", encoding="utf-8") as fp:
-            fp.write("[%s] %s\n" % (self._url, text))
+        logging.debug("[%s][Console] %s" % (self.__class__.__name__, text))
 
     async def wait_for_avatar(self, timeout: int = 30) -> None:
         time0 = time.time()
@@ -665,7 +706,12 @@ class WeReadWebPage(object):
         # await self.clear_cache()
         await self.pre_load_page()
         self._url = self._get_chapter_url(chapter_id)
-        await self._page.goto(self._url, timeout=1000 * timeout)
+        # 阅读页存在长时间挂起的子资源，导致 ``load`` 事件一直不触发，
+        # 而章节内容依赖渲染循环逐步绘制，改用 domcontentloaded 即可，
+        # 后续由 _check_next_page / get_markdown 负责等待内容加载完成。
+        await self._page.goto(
+            self._url, timeout=1000 * timeout, waitUntil="domcontentloaded"
+        )
         try:
             await self._check_next_page()
         except utils.LoginRequiredError:

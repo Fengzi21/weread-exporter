@@ -3,6 +3,7 @@ Web Proxy
 """
 
 import asyncio
+import base64
 import logging
 import re
 import sys
@@ -208,7 +209,7 @@ class ProxyRule(object):
         return result
 
     def get_interception_pattern(self) -> Dict[str, Any]:  # pyright: ignore[reportDeprecated]
-        """获取用于 CDP Network.setRequestInterception 的模式
+        """获取用于 CDP Fetch.enable 的模式
 
         Returns:
             dict: CDP 拦截模式
@@ -216,8 +217,7 @@ class ProxyRule(object):
         pattern: Dict[str, Any] = {"urlPattern": self._url_pattern}  # pyright: ignore[reportDeprecated]
         if self._resource_type:
             pattern["resourceType"] = self._resource_type
-        if self._stage != EnumProxyStage.Request:
-            pattern["interceptionStage"] = "Response"
+        pattern["requestStage"] = "Request"
         return pattern
 
 
@@ -382,14 +382,11 @@ class WebProxy(object):
     async def setup_interception(self) -> None:
         """启用网络请求拦截
 
-        使用 CDP API 直接拦截网络请求，不依赖 pyppeteer 的内部实现。
-        这样可以：
-        1. 自定义匹配模式（避免 '*' 硬编码）
-        2. 直接接收 requestIntercepted 事件（确保 requestId 可见）
+        使用 CDP 的 Fetch 域直接拦截网络请求，不依赖 pyppeteer 的内部实现
+        （pyppeteer 依赖的 ``Network.setRequestInterception`` 在 Chrome 119+
+        已被移除）。
         """
         logging.info("[%s] Setup interception" % self.__class__.__name__)
-        self._page._networkManager._userRequestInterceptionEnabled = True
-        self._page._networkManager._protocolRequestInterceptionEnabled = True
         patterns: List[Dict[str, Any]] = []  # pyright: ignore[reportDeprecated]
         for rule in self._proxy_rules:
             if rule.stage == EnumProxyStage.Request:
@@ -401,14 +398,12 @@ class WebProxy(object):
                 {"cacheDisabled": True},
             ),
             self._client.send(
-                "Network.setRequestInterception",
+                "Fetch.enable",
                 {"patterns": patterns},
             ),
         )
 
-        self._page.on(
-            "request", lambda req: asyncio.ensure_future(self.handle_request(req))
-        )
+        self._client.on("Fetch.requestPaused", self._on_request_paused)
 
     async def get_http_response(self, request: WebRequest) -> Optional[WebResponse]:  # pyright: ignore[reportDeprecated]
         """通过aiohttp获取http返回包，返回WebResponse对象
@@ -477,74 +472,152 @@ class WebProxy(object):
 
         return request_rule, response_rule
 
-    async def handle_request(self, request: Any) -> None:  # pyright: ignore[reportAny]
-        """处理请求
+    def _on_request_paused(self, event: Dict[str, Any]) -> None:
+        """Fetch.requestPaused 事件回调，调度异步处理任务"""
+        self._client._loop.create_task(self._handle_request_paused(event))
+
+    async def _handle_request_paused(self, event: Dict[str, Any]) -> None:
+        """处理被 Fetch 域拦截的请求
 
         遍历所有代理规则，找到第一个匹配的规则并调用其 handle 方法
 
         Args:
-            request: pyppeteer 的 Request 对象
+            event: Fetch.requestPaused 事件参数
         """
-        if request._interceptionHandled:  # pyright: ignore[reportAny]
-            logging.warning(
-                "[%s] Ignore handled request %s %s %s"
-                % (
-                    self.__class__.__name__,
-                    request.method,
-                    request.resourceType,
-                    request.url,
-                )
-            )
-            return
+        request_id: Optional[str] = event.get("requestId")
+        request_data: Dict[str, Any] = event.get("request") or {}
+        url: str = request_data.get("url", "")
+        method: str = request_data.get("method", "GET")
+        raw_headers: Dict[str, str] = request_data.get("headers") or {}
+        headers: Dict[str, str] = {k.lower(): v for k, v in raw_headers.items()}
+        post_data: Any = request_data.get("postData")
+        body: Optional[bytes] = None
+        if post_data:
+            if isinstance(post_data, bytes):
+                body = post_data
+            else:
+                body = str(post_data).encode("utf-8")
+
+        web_request = WebRequest(url=url, method=method, headers=headers, body=body)
         logging.info(
-            "[%s] Handle request %s %s %s"
-            % (
-                self.__class__.__name__,
-                request.method,
-                request.resourceType,
-                request.url,
-            )
+            "[%s] Handle request %s %s" % (self.__class__.__name__, method, url)
         )
-        request_rule, response_rule = self.get_rule(request)
+
+        request_rule, response_rule = self.get_rule(web_request)
         if request_rule:
-            # 将 pyppeteer Request 转换为 WebRequest
-            web_request = WebRequest.from_request(request)
             result = await request_rule.handle_request(web_request)
             if not isinstance(result, dict):
                 logging.warning(
                     "[WebProxy] Unexpected return type %s from callback, continuing request: %s"
-                    % (type(result), request.url)
+                    % (type(result), url)
                 )
-                await request.continue_()
+                await self._continue_request(request_id, post_data=post_data)
                 return
             proxy_type: int = result.pop("type", 0)
             if proxy_type == EnumProxyType.Mock:
-                await request.respond(result)
+                await self._fulfill_request(request_id, result)
                 return
             elif proxy_type == EnumProxyType.Block:
-                await request.abort()
+                await self._fail_request(request_id, "Failed")
                 return
             elif not response_rule:
-                await request.continue_()
+                await self._continue_request(request_id, post_data=post_data)
                 return
 
             response = await self.get_http_response(web_request)
             if not response:
                 # 没有获取到回包
-                await request.continue_()
+                await self._continue_request(request_id, post_data=post_data)
                 return
             result = await response_rule.handle_response(response)
             if result:
-                await request.respond(result)
+                await self._fulfill_request(request_id, result)
             else:
-                await request.continue_()
+                await self._continue_request(request_id, post_data=post_data)
             return
 
         # 没有匹配的 request 规则，继续原请求
         logging.info(
-            "[WebProxy] No request rule matched, continue request: %s" % request.url
+            "[WebProxy] No request rule matched, continue request: %s" % url
         )
-        await request.continue_()
+        await self._continue_request(request_id, post_data=post_data)
+
+    async def _continue_request(
+        self,
+        request_id: Optional[str],
+        overrides: Optional[Dict[str, Any]] = None,
+        post_data: Any = None,
+    ) -> None:
+        """继续被拦截的请求
+
+        Fetch.continueRequest 默认不会保留请求体，必须显式传入 ``postData``，
+        否则 POST 请求（如章节内容接口）会丢失请求体导致服务端拒绝。
+        """
+        if not request_id:
+            return
+        params: Dict[str, Any] = {"requestId": request_id}
+        if overrides:
+            params.update(overrides)
+        if post_data is not None:
+            # Fetch.continueRequest 的 postData 字段是 base64 编码的，
+            # 必须先将原始请求体编码为 base64。
+            raw = post_data.encode("utf-8") if isinstance(post_data, str) else bytes(post_data)
+            params["postData"] = base64.b64encode(raw).decode("ascii")
+        try:
+            await self._client.send("Fetch.continueRequest", params)
+        except Exception as ex:
+            logging.warning("[WebProxy] Continue request failed: %s" % str(ex))
+
+    async def _fail_request(
+        self, request_id: Optional[str], error_reason: str = "Failed"
+    ) -> None:
+        """终止被拦截的请求"""
+        if not request_id:
+            return
+        try:
+            await self._client.send(
+                "Fetch.failRequest",
+                {"requestId": request_id, "errorReason": error_reason},
+            )
+        except Exception as ex:
+            logging.warning("[WebProxy] Fail request failed: %s" % str(ex))
+
+    async def _fulfill_request(
+        self, request_id: Optional[str], response: Dict[str, Any]
+    ) -> None:
+        """用自定义响应满足被拦截的请求"""
+        if not request_id:
+            return
+        status: int = response.get("status", 200)
+        headers: Dict[str, str] = response.get("headers") or {}
+        body: Any = response.get("body")
+        params: Dict[str, Any] = {
+            "requestId": request_id,
+            "responseCode": status,
+        }
+        # 这些响应头与 Fetch.fulfillRequest 提供的完整（已解码）响应体冲突，
+        # 会导致页面 load 事件无法触发。必须移除。
+        strip_headers = {
+            "transfer-encoding",
+            "content-encoding",
+            "content-length",
+            "connection",
+        }
+        response_headers: List[Dict[str, str]] = [
+            {"name": k, "value": v}
+            for k, v in headers.items()
+            if k.lower() not in strip_headers
+        ]
+        if response_headers:
+            params["responseHeaders"] = response_headers
+        if body is not None:
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            params["body"] = base64.b64encode(body).decode("ascii")
+        try:
+            await self._client.send("Fetch.fulfillRequest", params)
+        except Exception as ex:
+            logging.warning("[WebProxy] Fulfill request failed: %s" % str(ex))
 
     def get_interception_patterns(self) -> List[Dict[str, Any]]:
         """获取所有规则的拦截模式

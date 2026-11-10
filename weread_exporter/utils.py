@@ -2,7 +2,7 @@ import hashlib
 import logging
 import random
 import sys
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import aiohttp
 from aiohttp.client import _RequestContextManager
@@ -116,7 +116,7 @@ async def fetch(
     headers: Optional[Dict[str, str]] = None,
     data: Optional[Union[str, bytes]] = None,
     respond_with_headers: bool = False,
-) -> Union[bytes, Tuple[int, Dict[str, str], bytes]]:
+) -> Union[bytes, Tuple[int, Mapping[str, str], bytes]]:
     headers: Dict[str, str] = headers or {}
     headers.pop("sec-ch-ua", None)
     headers.pop("sec-ch-ua-platform", None)
@@ -133,9 +133,9 @@ async def fetch(
                     # response.raise_for_status()
                     result = await response.read()
                     if respond_with_headers:
-                        # 转换 headers 为字典以匹配类型注解
-                        headers_dict = {k: v for k, v in response.headers.items()}
-                        return response.status, headers_dict, result
+                        # 返回保留重复值（如多个 Set-Cookie）的 headers，
+                        # 调用方可通过 getall() 获取全部同名 header。
+                        return response.status, response.headers.copy(), result
                     else:
                         return result
             except:
